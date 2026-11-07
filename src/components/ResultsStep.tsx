@@ -1,10 +1,9 @@
 import { useMemo, useState } from 'react';
-import { bestPlans, formatAmount, remindersText, withoutStores, type PlanSummary } from '../../shared/plan';
+import { bestPlans, formatAmount, remindersText, withoutStores, type PlanLine, type PlanSummary } from '../../shared/plan';
 import {
   SECTIONS,
   type GroceryList,
   type ListItem,
-  type Match,
   type PricesResponse,
   type StoreLocation,
 } from '../../shared/types';
@@ -34,20 +33,24 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
   const priced = useMemo(() => withoutStores(prices.priced, off), [prices, off]);
   const plans = useMemo(() => bestPlans(priced, maxStores), [priced, maxStores]);
   const [picked, setPicked] = useState<number | null>(null);
-  const planIdx = Math.min(picked ?? plans.length - 1, plans.length - 1);
+  // Default to fewer stores unless the extra stop saves at least $1.
+  const suggested = plans.reduce((best, p, i) => (p.total <= plans[best].total - 1 ? i : best), 0);
+  const planIdx = Math.min(picked ?? suggested, plans.length - 1);
   const plan: PlanSummary | undefined = plans[planIdx];
 
   const items = list.items.filter((it) => it.name.trim());
-  const matchesById = useMemo(
-    () => new Map(priced.map((p) => [p.itemId, p.matches])),
-    [priced],
-  );
-  const unassigned = items.filter((it) => !plan?.assignment.has(it.id));
+  const unpriced = items.filter((it) => !plan?.lines.has(it.id));
   const text = remindersText(items, plan, stores);
+  const groups = plan ? [...plan.stores, null] : [];
 
-  // Every store with at least one deal on this list, nearest first.
+  // Every store with a price for something on this list, nearest first.
   const dealCounts = new Map<string, number>();
-  for (const p of prices.priced) for (const m of p.matches) dealCounts.set(m.store, (dealCounts.get(m.store) ?? 0) + 1);
+  const saleCounts = new Map<string, number>();
+  for (const p of prices.priced)
+    for (const m of p.matches) {
+      dealCounts.set(m.store, (dealCounts.get(m.store) ?? 0) + 1);
+      if (m.onSale ?? true) saleCounts.set(m.store, (saleCounts.get(m.store) ?? 0) + 1);
+    }
   const allStores = [...dealCounts.keys()].sort(
     (a, b) => (stores[a]?.distanceKm ?? 999) - (stores[b]?.distanceKm ?? 999) || a.localeCompare(b),
   );
@@ -95,8 +98,11 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
                         </span>
                       )}
                     </span>
-                    <span className="shrink-0 text-xs text-stone-500">
-                      {dealCounts.get(store)} deal{dealCounts.get(store) === 1 ? '' : 's'}
+                    <span className="shrink-0 text-right text-xs text-stone-500">
+                      {dealCounts.get(store)} price{dealCounts.get(store) === 1 ? '' : 's'}
+                      {saleCounts.get(store) ? (
+                        <span className="block text-emerald-700">{saleCounts.get(store)} on sale</span>
+                      ) : null}
                     </span>
                   </label>
                 </li>
@@ -134,14 +140,14 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
       {plans.length === 0 ? (
         <p className="rounded-xl bg-white p-4 text-stone-600 shadow-sm ring-1 ring-stone-200">
           {excluded.length && allStores.length
-            ? 'Nothing on your list is on sale at the stores you have turned on.'
-            : `Nothing on your list is in this week's flyers at stores in ${where}.`}
+            ? 'No prices found at the stores you have turned on.'
+            : `No prices found at stores in ${where}.`}
         </p>
       ) : (
         <div className="grid gap-2" role="radiogroup" aria-label="Store plans">
           {plans.map((p, i) => (
             <button
-              key={p.stores.join('+')}
+              key={p.stores.join('+') || 'any'}
               role="radio"
               aria-checked={i === planIdx}
               onClick={() => setPicked(i)}
@@ -149,20 +155,24 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
             >
               <div className="flex items-baseline justify-between gap-2">
                 <span className="font-semibold">
-                  {p.stores.length} store{p.stores.length > 1 ? 's' : ''}
+                  {p.stores.length || 'Any'} store{p.stores.length === 1 ? '' : 's'}
                 </span>
-                <span className="text-xl font-bold tabular-nums">{money(p.total)}</span>
+                <span className="text-xl font-bold tabular-nums">
+                  {p.estimatedTotal > 0 ? '~' : ''}
+                  {money(p.total)}
+                </span>
               </div>
               <div className="text-sm text-stone-600">{p.stores.join(' + ')}</div>
               <div className="mt-1 flex flex-wrap gap-x-3 text-sm">
-                <span className="text-stone-500">
-                  {p.covered} of {items.length} on sale
-                </span>
-                {i > 0 && p.savingsVsOne > 0.005 && (
-                  <span className="font-semibold text-emerald-700">saves ~{money(p.savingsVsOne)} vs 1 store</span>
+                <span className="text-stone-500">{p.saleCount} on sale</span>
+                {p.savings > 0.005 && (
+                  <span className="font-semibold text-emerald-700">
+                    saves {p.savingsEstimated ? '~' : ''}
+                    {money(p.savings)}
+                  </span>
                 )}
-                {i > 0 && p.extraItems > 0 && (
-                  <span className="font-semibold text-emerald-700">+{p.extraItems} more on sale</span>
+                {i > 0 && p.savingsVsOne > 0.005 && (
+                  <span className="text-stone-500">{money(p.savingsVsOne)} less than 1 store</span>
                 )}
               </div>
             </button>
@@ -170,63 +180,89 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
         </div>
       )}
 
-      {plan?.stores.map((store) => {
-        const storeItems = items.filter((it) => plan.assignment.get(it.id)?.store === store);
-        const subtotal = storeItems.reduce((s, it) => s + plan.assignment.get(it.id)!.estCost, 0);
-        return (
-          <div key={store}>
-            <div className="mb-2 border-b-2 border-stone-800 pb-1">
-              <div className="flex items-baseline justify-between gap-2">
-                <h3 className="text-lg font-bold">{store}</h3>
-                <span className="shrink-0 text-sm text-stone-600">
-                  {storeItems.length} item{storeItems.length === 1 ? '' : 's'} ·{' '}
-                  <span className="font-semibold text-stone-900">{money(subtotal)}</span>
-                </span>
+      {plan &&
+        groups.map((store) => {
+          const storeItems = items.filter((it) => plan.lines.has(it.id) && plan.lines.get(it.id)!.store === store);
+          if (!storeItems.length) return null;
+          const subtotal = storeItems.reduce((s, it) => s + plan.lines.get(it.id)!.cost, 0);
+          const hasEstimate = storeItems.some((it) => plan.lines.get(it.id)!.kind === 'estimate');
+          const loc = store ? stores[store] : undefined;
+          return (
+            <div key={store ?? 'any'}>
+              <div className="mb-2 border-b-2 border-stone-800 pb-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <h3 className="text-lg font-bold">{store ?? 'Any store'}</h3>
+                  <span className="shrink-0 text-sm text-stone-600">
+                    {storeItems.length} item{storeItems.length === 1 ? '' : 's'} ·{' '}
+                    <span className="font-semibold text-stone-900">
+                      {hasEstimate ? '~' : ''}
+                      {money(subtotal)}
+                    </span>
+                  </span>
+                </div>
+                {store && loc && (
+                  <a
+                    href={mapsUrl(store, loc)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-sm text-emerald-700 underline underline-offset-2"
+                  >
+                    📍 {loc.address} · {loc.distanceKm} km
+                  </a>
+                )}
               </div>
-              {stores[store] && (
-                <a
-                  href={mapsUrl(store, stores[store])}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-sm text-emerald-700 underline underline-offset-2"
-                >
-                  📍 {stores[store].address} · {stores[store].distanceKm} km
-                </a>
-              )}
+              <BySection items={storeItems} sale={(it) => plan.lines.get(it.id)!.kind === 'sale'}>
+                {(it) => <PriceLine item={it} line={plan.lines.get(it.id)!} />}
+              </BySection>
             </div>
-            <BySection items={storeItems} render={(it) => <DealLine item={it} match={plan.assignment.get(it.id)!} />} />
-          </div>
-        );
-      })}
+          );
+        })}
 
-      {unassigned.length > 0 && (
+      {unpriced.length > 0 && (
         <div>
           <div className="mb-2 border-b-2 border-stone-400 pb-1">
-            <h3 className="text-lg font-bold text-stone-600">
-              {plans.length ? 'Not on sale at these stores' : 'Not on sale anywhere'}
-            </h3>
+            <h3 className="text-lg font-bold text-stone-600">Price unknown</h3>
           </div>
-          <BySection
-            items={unassigned}
-            render={(it) => {
-              const elsewhere = matchesById.get(it.id)?.[0];
-              return (
-                <div className="flex justify-between gap-3">
-                  <span>
-                    <span className="font-medium">{it.name}</span>{' '}
-                    <span className="text-stone-500">{formatAmount(it)}</span>
-                  </span>
-                  {elsewhere && (
-                    <span className="shrink-0 text-right text-xs text-stone-500">
-                      on sale at {elsewhere.store}
-                      <br />
-                      {money(elsewhere.estCost)}
-                    </span>
-                  )}
-                </div>
-              );
-            }}
-          />
+          <BySection items={unpriced}>
+            {(it) => (
+              <span>
+                <span className="font-medium">{it.name}</span>{' '}
+                <span className="text-stone-500">{formatAmount(it)}</span>
+              </span>
+            )}
+          </BySection>
+        </div>
+      )}
+
+      {plan && (
+        <div className="rounded-xl bg-white p-4 shadow-sm ring-1 ring-stone-200">
+          <div className="flex justify-between text-sm text-stone-600">
+            <span>Regular price</span>
+            <span className="tabular-nums line-through">
+              {plan.estimatedTotal > 0 || plan.savingsEstimated ? '~' : ''}
+              {money(plan.total + plan.savings)}
+            </span>
+          </div>
+          <div className="flex justify-between text-sm text-emerald-700">
+            <span>Sale savings ({plan.saleCount} item{plan.saleCount === 1 ? '' : 's'})</span>
+            <span className="tabular-nums">
+              −{money(plan.savings)}
+              {plan.savingsEstimated && <span className="text-xs"> est.</span>}
+            </span>
+          </div>
+          <div className="mt-1 flex items-baseline justify-between border-t border-stone-200 pt-2">
+            <span className="font-semibold">Estimated total</span>
+            <span className="text-xl font-bold tabular-nums">
+              {plan.estimatedTotal > 0 ? '~' : ''}
+              {money(plan.total)}
+            </span>
+          </div>
+          {plan.savings > 0.005 && (
+            <p className="mt-3 rounded-lg bg-emerald-50 p-3 text-center font-semibold text-emerald-800">
+              Potential savings: {plan.savingsEstimated ? '~' : ''}
+              {money(plan.savings)}
+            </p>
+          )}
         </div>
       )}
 
@@ -237,8 +273,9 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
       )}
 
       <p className="text-xs text-stone-500">
-        Flyer prices only; totals cover the on-sale items. "Saves" compares the whole list, counting items a plan
-        doesn't have on sale at the highest flyer price we found for them.
+        Sale prices come from this week's flyers and store websites. Regular prices are from the store's website
+        (No Frills, Zehrs, Fortinos, Superstore, Loblaws and other Loblaw stores); everywhere else, and prices marked
+        ~, are estimates of a typical Ontario price. Costs are for the amount your recipes need.
       </p>
 
       <RemindersHelp />
@@ -247,7 +284,15 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, s
   );
 }
 
-function BySection({ items, render }: { items: ListItem[]; render: (it: ListItem) => React.ReactNode }) {
+function BySection({
+  items,
+  children,
+  sale,
+}: {
+  items: ListItem[];
+  children: (it: ListItem) => React.ReactNode;
+  sale?: (it: ListItem) => boolean;
+}) {
   return (
     <div className="space-y-3">
       {SECTIONS.map((section) => {
@@ -256,10 +301,13 @@ function BySection({ items, render }: { items: ListItem[]; render: (it: ListItem
         return (
           <div key={section}>
             <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-stone-500">{section}</h4>
-            <ul className="divide-y divide-stone-100 rounded-xl bg-white shadow-sm ring-1 ring-stone-200">
+            <ul className="divide-y divide-stone-100 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-stone-200">
               {group.map((it) => (
-                <li key={it.id} className="px-3 py-2.5">
-                  {render(it)}
+                <li
+                  key={it.id}
+                  className={`px-3 py-2.5 ${sale?.(it) ? 'border-l-4 border-emerald-500 bg-emerald-50' : ''}`}
+                >
+                  {children(it)}
                 </li>
               ))}
             </ul>
@@ -270,28 +318,54 @@ function BySection({ items, render }: { items: ListItem[]; render: (it: ListItem
   );
 }
 
-function DealLine({ item, match }: { item: ListItem; match: Match }) {
-  const { deal } = match;
-  const sale = [deal.priceText && !/^each$/i.test(deal.priceText) ? deal.priceText : null, deal.saleStory]
-    .filter(Boolean)
-    .join(' · ');
-  const ends = endDate(deal.validTo);
+function PriceLine({ item, line }: { item: ListItem; line: PlanLine }) {
+  const deal = line.match?.deal;
+  const sale =
+    deal && line.kind === 'sale'
+      ? [deal.priceText && !/^each$/i.test(deal.priceText) ? deal.priceText : null, deal.saleStory]
+          .filter(Boolean)
+          .join(' · ')
+      : '';
+  const ends = deal ? endDate(deal.validTo) : null;
   return (
     <div>
       <div className="flex items-baseline justify-between gap-3">
         <span>
+          {line.kind === 'sale' && (
+            <span className="mr-1.5 rounded bg-emerald-600 px-1.5 py-0.5 align-middle text-[10px] font-bold uppercase tracking-wide text-white">
+              Sale
+            </span>
+          )}
           <span className="font-medium">{item.name}</span>{' '}
           <span className="text-stone-500">{formatAmount(item)}</span>
         </span>
-        <span className="shrink-0 font-semibold tabular-nums">{money(match.estCost)}</span>
+        <span className="shrink-0 text-right tabular-nums">
+          {line.kind === 'sale' && line.regular != null && (
+            <span className="mr-1.5 text-sm text-stone-400 line-through">
+              {line.regularEstimated ? '~' : ''}
+              {money(line.regular)}
+            </span>
+          )}
+          <span className={`font-semibold ${line.kind === 'sale' ? 'text-emerald-700' : ''}`}>
+            {line.kind === 'estimate' ? '~' : ''}
+            {money(line.cost)}
+          </span>
+        </span>
       </div>
       <div className="mt-0.5 text-xs leading-snug text-stone-500">
-        <span className="text-stone-700">{deal.name}</span> · ${deal.currentPrice}
-        {deal.priceText && /\//.test(deal.priceText) ? deal.priceText : ''} · {match.unitPrice}
-        <br />
-        Buy {match.buy}
-        {sale && <span className="text-emerald-700"> · {sale.length > 70 ? `${sale.slice(0, 70)}…` : sale}</span>}
-        {ends && <span> · ends {ends}</span>}
+        {line.kind === 'estimate' ? (
+          'Estimated regular price (no price data for this store)'
+        ) : (
+          <>
+            <span className="text-stone-700">{deal?.name}</span> · ${deal?.currentPrice}
+            {deal?.priceText && /\//.test(deal.priceText) ? deal.priceText : ''} · {line.match?.unitPrice}
+            <br />
+            Buy {line.match?.buy}
+            {line.kind === 'regular' && <span> · regular price</span>}
+            {sale && <span className="text-emerald-700"> · {sale.length > 70 ? `${sale.slice(0, 70)}…` : sale}</span>}
+            {ends && <span> · ends {ends}</span>}
+          </>
+        )}
       </div>
     </div>
   );

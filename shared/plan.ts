@@ -1,40 +1,34 @@
 import { SECTIONS, type ListItem, type Match, type PricedItem, type StoreLocation } from './types';
 
-export interface StorePlan {
+/** How one item is bought in a plan. */
+export interface PlanLine {
+  /** null only when no store has any data and we fall back to an estimate. */
+  store: string | null;
+  /** sale: flyer/website sale; regular: the store's own shelf price; estimate: Claude's typical price. */
+  kind: 'sale' | 'regular' | 'estimate';
+  cost: number;
+  /** The same purchase at regular price (sale lines only). */
+  regular: number | null;
+  /** True when `regular` is Claude's estimate rather than the store's stated price. */
+  regularEstimated: boolean;
+  match?: Match;
+}
+
+export interface PlanSummary {
   stores: string[];
-  /** What you pay for the on-sale items in this plan. */
+  /** itemId -> line. Items with no price at all are missing. */
+  lines: Map<string, PlanLine>;
+  /** Everything priced, sale + regular + estimated. */
   total: number;
-  /**
-   * Comparable cost of the whole list: items this plan has no deal for are
-   * counted at the highest flyer price found for them elsewhere.
-   */
-  score: number;
-  /** itemId -> chosen match */
-  assignment: Map<string, Match>;
-  covered: number;
-}
-
-export interface PlanSummary extends StorePlan {
-  /** Estimated savings vs the best 1-store plan, across the whole list. */
+  /** Part of `total` that is estimated. */
+  estimatedTotal: number;
+  /** Sum over sale lines of (regular - sale). */
+  savings: number;
+  /** True when some of the savings use an estimated regular price. */
+  savingsEstimated: boolean;
+  saleCount: number;
+  /** Cheaper than the best 1-store plan by this much. */
   savingsVsOne: number;
-  /** Items on sale in this plan that the 1-store plan doesn't have. */
-  extraItems: number;
-}
-
-/** Per item, the cheapest match per store (input should already be one per store). */
-function costTable(priced: PricedItem[]) {
-  const stores = new Set<string>();
-  const table = new Map<string, Map<string, Match>>();
-  for (const p of priced) {
-    const byStore = new Map<string, Match>();
-    for (const m of p.matches) {
-      const prev = byStore.get(m.store);
-      if (!prev || m.estCost < prev.estCost) byStore.set(m.store, m);
-      stores.add(m.store);
-    }
-    table.set(p.itemId, byStore);
-  }
-  return { stores: [...stores], table };
 }
 
 function combinations<T>(arr: T[], k: number): T[][] {
@@ -51,78 +45,103 @@ function combinations<T>(arr: T[], k: number): T[][] {
   return out;
 }
 
-function evaluate(
-  stores: string[],
-  table: Map<string, Map<string, Match>>,
-  fallback: Map<string, number>,
-): StorePlan {
-  const assignment = new Map<string, Match>();
-  let total = 0;
-  let score = 0;
-  for (const [itemId, byStore] of table) {
-    let best: Match | undefined;
+function lineFor(m: Match, est: number | null): PlanLine {
+  const onSale = m.onSale ?? true; // older saved results only had flyer deals
+  if (!onSale) return { store: m.store, kind: 'regular', cost: m.estCost, regular: null, regularEstimated: false, match: m };
+  const stated = m.regularCost ?? null;
+  const regular = stated ?? (est != null && est > m.estCost ? est : null);
+  return {
+    store: m.store,
+    kind: 'sale',
+    cost: m.estCost,
+    regular,
+    regularEstimated: stated == null && regular != null,
+    match: m,
+  };
+}
+
+function evaluate(stores: string[], priced: PricedItem[]): PlanSummary {
+  const lines = new Map<string, PlanLine>();
+  const pending: { itemId: string; lacking: string[] }[] = [];
+  for (const p of priced) {
+    const est = p.estRegularCost ?? null;
+    let best: PlanLine | undefined;
     for (const s of stores) {
-      const m = byStore.get(s);
-      if (m && (!best || m.estCost < best.estCost)) best = m;
+      const m = p.matches.find((x) => x.store === s);
+      if (!m) continue;
+      const line = lineFor(m, est);
+      if (!best || line.cost < best.cost - 0.005 || (Math.abs(line.cost - best.cost) <= 0.005 && line.kind === 'sale'))
+        best = line;
     }
-    if (best) {
-      assignment.set(itemId, best);
-      total += best.estCost;
-      score += best.estCost;
-    } else {
-      score += fallback.get(itemId) ?? 0;
+    // A plan store with no data for this item: assume the typical price there.
+    const lacking = stores.filter((s) => !p.matches.some((x) => x.store === s));
+    if (est != null && (lacking.length || !stores.length) && (!best || est < best.cost - 0.005)) {
+      lines.set(p.itemId, { store: null, kind: 'estimate', cost: est, regular: null, regularEstimated: false });
+      pending.push({ itemId: p.itemId, lacking });
+    } else if (best) {
+      lines.set(p.itemId, best);
     }
   }
-  return { stores, total, score, assignment, covered: assignment.size };
+  // Put estimated items at the plan store already carrying the most.
+  const counts = new Map<string, number>();
+  for (const l of lines.values()) if (l.store) counts.set(l.store, (counts.get(l.store) ?? 0) + 1);
+  for (const { itemId, lacking } of pending) {
+    if (!lacking.length) continue;
+    const store = [...lacking].sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0))[0];
+    lines.get(itemId)!.store = store;
+    counts.set(store, (counts.get(store) ?? 0) + 1);
+  }
+
+  let total = 0;
+  let estimatedTotal = 0;
+  let savings = 0;
+  let savingsEstimated = false;
+  let saleCount = 0;
+  for (const l of lines.values()) {
+    total += l.cost;
+    if (l.kind === 'estimate') estimatedTotal += l.cost;
+    if (l.kind === 'sale') {
+      saleCount++;
+      if (l.regular != null && l.regular > l.cost) {
+        savings += l.regular - l.cost;
+        if (l.regularEstimated) savingsEstimated = true;
+      }
+    }
+  }
+  const ordered = [...stores].sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0));
+  return { stores: ordered, lines, total, estimatedTotal, savings, savingsEstimated, saleCount, savingsVsOne: 0 };
 }
 
 /**
- * Cheapest plan for each store count 1..maxStores, compared on the whole
- * list (see StorePlan.score) so plans covering different items are fair.
+ * Cheapest plan for each store count 1..maxStores over the whole list.
  * A plan only counts as k-store if every store in it is actually used.
  */
 export function bestPlans(priced: PricedItem[], maxStores: number): PlanSummary[] {
-  const { stores, table } = costTable(priced);
-  // No regular prices yet: an item bought off-plan costs at least its
-  // most expensive flyer price.
-  const fallback = new Map<string, number>();
-  for (const [itemId, byStore] of table) {
-    const costs = [...byStore.values()].map((m) => m.estCost);
-    if (costs.length) fallback.set(itemId, Math.max(...costs));
+  const stores = [...new Set(priced.flatMap((p) => p.matches.map((m) => m.store)))];
+  if (!stores.length) {
+    const plan = evaluate([], priced);
+    return plan.lines.size ? [plan] : [];
   }
-  const plans: StorePlan[] = [];
+  const plans: PlanSummary[] = [];
   for (let k = 1; k <= Math.min(maxStores, stores.length); k++) {
-    let best: StorePlan | undefined;
+    let best: PlanSummary | undefined;
     for (const combo of combinations(stores, k)) {
-      const plan = evaluate(combo, table, fallback);
-      const used = new Set([...plan.assignment.values()].map((m) => m.store));
-      if (used.size < k) continue;
+      const plan = evaluate(combo, priced);
+      const used = new Set([...plan.lines.values()].map((l) => l.store));
+      if (combo.some((s) => !used.has(s))) continue;
       if (
         !best ||
-        plan.score < best.score - 0.005 ||
-        (Math.abs(plan.score - best.score) <= 0.005 && plan.covered > best.covered)
+        plan.total < best.total - 0.005 ||
+        (Math.abs(plan.total - best.total) <= 0.005 && plan.saleCount > best.saleCount)
       ) {
         best = plan;
       }
     }
-    if (best) {
-      // Order stores by how many items they carry in this plan.
-      const counts = new Map<string, number>();
-      for (const m of best.assignment.values()) counts.set(m.store, (counts.get(m.store) ?? 0) + 1);
-      best.stores.sort((a, b) => (counts.get(b) ?? 0) - (counts.get(a) ?? 0));
-      plans.push(best);
-    }
+    if (best) plans.push(best);
   }
-
   const one = plans[0];
-  return plans.map((p) => {
-    let extraItems = 0;
-    if (one && p !== one) {
-      for (const itemId of p.assignment.keys()) if (!one.assignment.has(itemId)) extraItems++;
-    }
-    const savingsVsOne = one && p !== one ? one.score - p.score : 0;
-    return { ...p, savingsVsOne, extraItems };
-  });
+  for (const p of plans) p.savingsVsOne = one && p !== one ? one.total - p.total : 0;
+  return plans;
 }
 
 export function formatAmount(item: Pick<ListItem, 'amount' | 'unit' | 'note'>): string {
@@ -144,12 +163,12 @@ export function withoutStores(priced: PricedItem[], excluded: Set<string>): Pric
 /** Lines for the Reminders shortcut: "Store (street) · Item – amount", by store, then category. */
 export function remindersText(
   items: ListItem[],
-  plan: StorePlan | undefined,
+  plan: PlanSummary | undefined,
   stores: Record<string, StoreLocation> = {},
 ): string {
   const order = [...(plan?.stores ?? []), 'Any store'];
   const lines = items.map((item) => {
-    const store = plan?.assignment.get(item.id)?.store ?? 'Any store';
+    const store = plan?.lines.get(item.id)?.store ?? 'Any store';
     const street = streetOf(stores[store]);
     const amt = formatAmount(item);
     return {

@@ -41,12 +41,19 @@ export interface Deal {
   imageUrl: string | null;
 }
 
-/** Claude's chosen deal for one item at one store. */
+/** Claude's chosen product for one item at one store (flyer deal or shelf price). */
 export interface Match {
   store: string;
+  /** For shelf prices this is synthesized from the product (negative dealId, no validTo). */
   deal: Deal;
-  /** Estimated cost to buy the amount needed at this deal. */
+  /** Where the price came from: this week's flyer, or the store's own website. */
+  source?: 'flyer' | 'shelf';
+  /** True for flyer deals and shelf products marked on sale. */
+  onSale?: boolean;
+  /** Estimated cost to buy the amount needed at this price. */
   estCost: number;
+  /** The same purchase at the regular price, when the store states it (was-price). */
+  regularCost?: number | null;
   /** Normalized unit price, e.g. "$8.80/kg" or "$2.50 each". */
   unitPrice: string;
   /** What to buy, e.g. "1 pack (~1 kg)". */
@@ -56,7 +63,10 @@ export interface Match {
 
 export interface PricedItem {
   itemId: string;
+  /** Real prices, at most one per store, cheapest first. */
   matches: Match[];
+  /** Claude's estimate of the typical regular cost (Ontario) of the amount needed. */
+  estRegularCost?: number | null;
 }
 
 /** Nearest location of a flyer merchant inside the shopper's city. */
