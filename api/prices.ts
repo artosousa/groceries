@@ -1,6 +1,7 @@
 import type { PricesRequest, PricesResponse } from '../shared/types.js';
 import { dealsByTerm } from '../server/apify.js';
 import { matchDeals } from '../server/claude.js';
+import { localStores } from '../server/locations.js';
 import { HttpError, LIMITS, handle, json, rateLimit, readJson, toFsa } from '../server/http.js';
 
 export const POST = handle(async (req) => {
@@ -18,15 +19,21 @@ export const POST = handle(async (req) => {
 
   const { byTerm, cached, fetched } = await dealsByTerm(fsa, items.map((it) => it.searchTerm));
   const now = Date.now();
-  const candidates = items.map((it) =>
+  const live = items.map((it) =>
     (byTerm.get(it.searchTerm.trim().toLowerCase()) ?? []).filter(
       (d) => !d.validTo || Date.parse(d.validTo) > now,
     ),
   );
+  // Flyers cover a wide area: keep only chains with a location in the shopper's city.
+  const local = await localStores(fsa, [...new Set(live.flat().map((d) => d.merchant))]);
+  const candidates = local ? live.map((deals) => deals.filter((d) => d.merchant in local.stores)) : live;
   const matches = await matchDeals(items, candidates);
 
   const res: PricesResponse = {
     postal: fsa,
+    city: local?.city ?? null,
+    stores: local?.stores ?? {},
+    storesChecked: Boolean(local),
     priced: items.map((it) => ({ itemId: it.id, matches: matches.get(it.id) ?? [] })),
     cachedTerms: cached,
     fetchedTerms: fetched,

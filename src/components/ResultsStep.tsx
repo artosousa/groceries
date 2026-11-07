@@ -1,12 +1,22 @@
 import { useMemo, useState } from 'react';
-import { bestPlans, formatAmount, remindersText, type PlanSummary } from '../../shared/plan';
-import { SECTIONS, type GroceryList, type ListItem, type Match, type PricesResponse } from '../../shared/types';
+import { bestPlans, formatAmount, remindersText, withoutStores, type PlanSummary } from '../../shared/plan';
+import {
+  SECTIONS,
+  type GroceryList,
+  type ListItem,
+  type Match,
+  type PricesResponse,
+  type StoreLocation,
+} from '../../shared/types';
 
 interface Props {
   list: GroceryList;
   prices: PricesResponse;
   maxStores: number;
   setMaxStores: (n: number) => void;
+  /** Stores the shopper turned off (merchant names). */
+  excluded: string[];
+  setExcluded: (s: string[]) => void;
 }
 
 const money = (n: number) => `$${n.toFixed(2)}`;
@@ -15,23 +25,91 @@ const endDate = (iso: string | null) =>
 
 const SHORTCUT_NAME = 'Add to Groceries';
 
-export function ResultsStep({ list, prices, maxStores, setMaxStores }: Props) {
-  const plans = useMemo(() => bestPlans(prices.priced, maxStores), [prices, maxStores]);
+const mapsUrl = (store: string, loc: StoreLocation) =>
+  `https://maps.apple.com/?q=${encodeURIComponent(store)}&ll=${loc.lat},${loc.lon}`;
+
+export function ResultsStep({ list, prices, maxStores, setMaxStores, excluded, setExcluded }: Props) {
+  const stores = prices.stores ?? {};
+  const off = useMemo(() => new Set(excluded), [excluded]);
+  const priced = useMemo(() => withoutStores(prices.priced, off), [prices, off]);
+  const plans = useMemo(() => bestPlans(priced, maxStores), [priced, maxStores]);
   const [picked, setPicked] = useState<number | null>(null);
   const planIdx = Math.min(picked ?? plans.length - 1, plans.length - 1);
   const plan: PlanSummary | undefined = plans[planIdx];
 
   const items = list.items.filter((it) => it.name.trim());
   const matchesById = useMemo(
-    () => new Map(prices.priced.map((p) => [p.itemId, p.matches])),
-    [prices],
+    () => new Map(priced.map((p) => [p.itemId, p.matches])),
+    [priced],
   );
   const unassigned = items.filter((it) => !plan?.assignment.has(it.id));
-  const text = remindersText(items, plan);
+  const text = remindersText(items, plan, stores);
+
+  // Every store with at least one deal on this list, nearest first.
+  const dealCounts = new Map<string, number>();
+  for (const p of prices.priced) for (const m of p.matches) dealCounts.set(m.store, (dealCounts.get(m.store) ?? 0) + 1);
+  const allStores = [...dealCounts.keys()].sort(
+    (a, b) => (stores[a]?.distanceKm ?? 999) - (stores[b]?.distanceKm ?? 999) || a.localeCompare(b),
+  );
+  const toggle = (store: string) => {
+    setExcluded(off.has(store) ? excluded.filter((s) => s !== store) : [...excluded, store]);
+    setPicked(null);
+  };
+  const where = prices.city ?? prices.postal;
 
   return (
     <section className="space-y-5 pb-28">
       <h2 className="text-lg font-semibold">3. Where to shop</h2>
+
+      {prices.storesChecked === false && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+          Couldn't check store locations right now, so some of these stores may not be in your city.
+        </p>
+      )}
+
+      {allStores.length > 0 && (
+        <details className="rounded-xl bg-white p-3 shadow-sm ring-1 ring-stone-200" open={excluded.length > 0 || undefined}>
+          <summary className="cursor-pointer text-sm font-medium">
+            Stores in {where}{' '}
+            <span className="text-stone-500">
+              ({allStores.length - allStores.filter((s) => off.has(s)).length} of {allStores.length} on)
+            </span>
+          </summary>
+          <ul className="mt-2 divide-y divide-stone-100">
+            {allStores.map((store) => {
+              const loc = stores[store];
+              return (
+                <li key={store}>
+                  <label className="flex cursor-pointer items-center gap-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={!off.has(store)}
+                      onChange={() => toggle(store)}
+                      className="size-5 shrink-0 accent-emerald-600"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className={`font-medium ${off.has(store) ? 'text-stone-400 line-through' : ''}`}>{store}</span>
+                      {loc && (
+                        <span className="block truncate text-xs text-stone-500">
+                          {loc.address} · {loc.distanceKm} km
+                        </span>
+                      )}
+                    </span>
+                    <span className="shrink-0 text-xs text-stone-500">
+                      {dealCounts.get(store)} deal{dealCounts.get(store) === 1 ? '' : 's'}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+          {prices.storesChecked && (
+            <p className="mt-1 text-xs text-stone-500">
+              Stores without a location in {where} are hidden. Locations from OpenStreetMap.
+            </p>
+          )}
+        </details>
+      )}
 
       <div className="flex items-center justify-between">
         <span className="text-sm font-medium text-stone-700">Max stores</span>
@@ -55,7 +133,9 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores }: Props) {
 
       {plans.length === 0 ? (
         <p className="rounded-xl bg-white p-4 text-stone-600 shadow-sm ring-1 ring-stone-200">
-          Nothing on your list is in this week's flyers near {prices.postal}.
+          {excluded.length && allStores.length
+            ? 'Nothing on your list is on sale at the stores you have turned on.'
+            : `Nothing on your list is in this week's flyers at stores in ${where}.`}
         </p>
       ) : (
         <div className="grid gap-2" role="radiogroup" aria-label="Store plans">
@@ -95,11 +175,24 @@ export function ResultsStep({ list, prices, maxStores, setMaxStores }: Props) {
         const subtotal = storeItems.reduce((s, it) => s + plan.assignment.get(it.id)!.estCost, 0);
         return (
           <div key={store}>
-            <div className="mb-2 flex items-baseline justify-between border-b-2 border-stone-800 pb-1">
-              <h3 className="text-lg font-bold">{store}</h3>
-              <span className="text-sm text-stone-600">
-                {storeItems.length} item{storeItems.length === 1 ? '' : 's'} · <span className="font-semibold text-stone-900">{money(subtotal)}</span>
-              </span>
+            <div className="mb-2 border-b-2 border-stone-800 pb-1">
+              <div className="flex items-baseline justify-between gap-2">
+                <h3 className="text-lg font-bold">{store}</h3>
+                <span className="shrink-0 text-sm text-stone-600">
+                  {storeItems.length} item{storeItems.length === 1 ? '' : 's'} ·{' '}
+                  <span className="font-semibold text-stone-900">{money(subtotal)}</span>
+                </span>
+              </div>
+              {stores[store] && (
+                <a
+                  href={mapsUrl(store, stores[store])}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sm text-emerald-700 underline underline-offset-2"
+                >
+                  📍 {stores[store].address} · {stores[store].distanceKm} km
+                </a>
+              )}
             </div>
             <BySection items={storeItems} render={(it) => <DealLine item={it} match={plan.assignment.get(it.id)!} />} />
           </div>
@@ -262,7 +355,7 @@ function RemindersHelp() {
         <li>Make a list called Groceries in Reminders if you don't have one.</li>
       </ol>
       <p className="mt-2 text-stone-500">
-        No iPhone? Use <b>Copy list</b> and paste it anywhere. Each line is "Store · Item – amount".
+        No iPhone? Use <b>Copy list</b> and paste it anywhere. Each line is "Store (street) · Item – amount".
       </p>
     </details>
   );
