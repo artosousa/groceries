@@ -175,7 +175,7 @@ export async function matchPrices(
 
   const msg = await anthropic().beta.messages.parse({
     ...base,
-    max_tokens: 32000,
+    max_tokens: 20000, // non-streaming calls must stay under ~21.3k (SDK limit)
     output_config: { effort: 'medium', format: betaZodOutputFormat(MatchSchema) },
     messages: [{ role: 'user', content: `${MATCH_PROMPT}\n\n${blocks.join('\n\n')}` }],
   });
