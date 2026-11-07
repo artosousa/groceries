@@ -1,4 +1,4 @@
-import type { ListItem, Match, PricedItem } from './types';
+import { SECTIONS, type ListItem, type Match, type PricedItem, type StoreLocation } from './types';
 
 export interface StorePlan {
   stores: string[];
@@ -132,15 +132,31 @@ export function formatAmount(item: Pick<ListItem, 'amount' | 'unit' | 'note'>): 
   return item.note ? (base ? `${base} (${item.note})` : item.note) : base;
 }
 
-/** Lines for the Reminders shortcut: "Store · Item – amount". */
-export function remindersText(items: ListItem[], plan: StorePlan | undefined): string {
-  const lines: { store: string; line: string }[] = [];
-  for (const item of items) {
-    const store = plan?.assignment.get(item.id)?.store ?? 'Any store';
-    const amt = formatAmount(item);
-    lines.push({ store, line: `${store} · ${item.name}${amt ? ` – ${amt}` : ''}` });
-  }
+/** First part of an address, e.g. "71 Wilson Street West". */
+export const streetOf = (loc: StoreLocation | undefined) => loc?.address.split(',')[0].trim() || '';
+
+/** Drop matches at stores the shopper turned off. */
+export function withoutStores(priced: PricedItem[], excluded: Set<string>): PricedItem[] {
+  if (!excluded.size) return priced;
+  return priced.map((p) => ({ ...p, matches: p.matches.filter((m) => !excluded.has(m.store)) }));
+}
+
+/** Lines for the Reminders shortcut: "Store (street) · Item – amount", by store, then category. */
+export function remindersText(
+  items: ListItem[],
+  plan: StorePlan | undefined,
+  stores: Record<string, StoreLocation> = {},
+): string {
   const order = [...(plan?.stores ?? []), 'Any store'];
-  lines.sort((a, b) => order.indexOf(a.store) - order.indexOf(b.store));
+  const lines = items.map((item) => {
+    const store = plan?.assignment.get(item.id)?.store ?? 'Any store';
+    const street = streetOf(stores[store]);
+    const amt = formatAmount(item);
+    return {
+      rank: order.indexOf(store) * 100 + SECTIONS.indexOf(item.section),
+      line: `${street ? `${store} (${street})` : store} · ${item.name}${amt ? ` – ${amt}` : ''}`,
+    };
+  });
+  lines.sort((a, b) => a.rank - b.rank);
   return lines.map((l) => l.line).join('\n');
 }

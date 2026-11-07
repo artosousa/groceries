@@ -14,6 +14,7 @@ export default function App() {
   const [list, setList] = useState<GroceryList | null>(() => load('list', null));
   const [prices, setPrices] = useState<PricesResponse | null>(() => load('prices', null));
   const [maxStores, setMaxStores] = useState<number>(() => load('maxStores', 2));
+  const [excluded, setExcluded] = useState<string[]>(() => load('excludedStores', []));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,6 +22,7 @@ export default function App() {
   useEffect(() => save('list', list), [list]);
   useEffect(() => save('prices', prices), [prices]);
   useEffect(() => save('maxStores', maxStores), [maxStores]);
+  useEffect(() => save('excludedStores', excluded), [excluded]);
 
   const changePostal = useCallback(
     (fsa: string) => {
@@ -98,7 +100,14 @@ export default function App() {
             <button onClick={() => setPrices(null)} className="text-sm font-medium text-emerald-700">
               ← Edit list
             </button>
-            <ResultsStep list={list} prices={prices} maxStores={maxStores} setMaxStores={setMaxStores} />
+            <ResultsStep
+              list={list}
+              prices={prices}
+              maxStores={maxStores}
+              setMaxStores={setMaxStores}
+              excluded={excluded}
+              setExcluded={setExcluded}
+            />
           </>
         )}
       </div>

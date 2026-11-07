@@ -59,8 +59,25 @@ export interface PricedItem {
   matches: Match[];
 }
 
+/** Nearest location of a flyer merchant inside the shopper's city. */
+export interface StoreLocation {
+  name: string;
+  /** "71 Wilson Street West, Ancaster" (may be just the city if unknown). */
+  address: string;
+  lat: number;
+  lon: number;
+  /** From the centre of the shopper's postal area. */
+  distanceKm: number;
+}
+
 export interface PricesResponse {
   postal: string;
+  /** Municipality used to filter stores, e.g. "Hamilton". */
+  city?: string | null;
+  /** merchant -> its nearest in-city location. Only these stores are in `priced`. */
+  stores?: Record<string, StoreLocation>;
+  /** False when the location lookup failed and deals were not filtered by city. */
+  storesChecked?: boolean;
   priced: PricedItem[];
   /** Search terms that came from cache (no Apify cost). */
   cachedTerms: number;
